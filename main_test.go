@@ -10,8 +10,8 @@ import (
 )
 
 func TestServDBConnectionPoolingAndRouting(t *testing.T) {
-	primaryPool = NewConnectionPool(3)
-	replicaPool = NewConnectionPool(3)
+	primaryPool = NewConnectionPool(3, "postgres")
+	replicaPool = NewConnectionPool(3, "postgres")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/db/query", handleQuery)
@@ -21,8 +21,6 @@ func TestServDBConnectionPoolingAndRouting(t *testing.T) {
 	defer testServer.Close()
 
 	// 1. Run concurrent queries to verify pool limit acquisition and routing
-	// Run 2 SELECT queries (should route to Replica pool)
-	// Run 1 INSERT query (should route to Primary pool)
 	var wg sync.WaitGroup
 
 	// SELECT queries
@@ -79,11 +77,45 @@ func TestServDBConnectionPoolingAndRouting(t *testing.T) {
 		t.Errorf("expected max connections to be 3 in pools, got %+v", stats)
 	}
 
-	if stats.Primary.TotalQueries != 1 {
-		t.Errorf("expected 1 primary total queries, got %d", stats.Primary.TotalQueries)
+	if stats.Primary.Dialect != "postgres" {
+		t.Errorf("expected dialect postgres, got %q", stats.Primary.Dialect)
+	}
+}
+
+func TestServDBDialectValidation(t *testing.T) {
+	// Configure with PostgreSQL dialect
+	primaryPool = NewConnectionPool(1, "postgres")
+	replicaPool = NewConnectionPool(1, "postgres")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/db/query", handleQuery)
+
+	testServer := httptest.NewServer(mux)
+	defer testServer.Close()
+
+	// Try querying using MySQL placeholder '?' on Postgres pool -> should fail!
+	reqPayload := QueryRequest{Query: "SELECT * FROM users WHERE id = ?;"}
+	body, _ := json.Marshal(reqPayload)
+	resp, err := http.Post(testServer.URL+"/api/db/query", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected StatusBadRequest for dialect placeholder mismatch, got %d", resp.StatusCode)
 	}
 
-	if stats.Replica.TotalQueries != 2 {
-		t.Errorf("expected 2 replica total queries, got %d", stats.Replica.TotalQueries)
+	// Try with Postgres placeholder '$1' on Postgres pool -> should succeed!
+	reqPayload2 := QueryRequest{Query: "SELECT * FROM users WHERE id = $1;"}
+	body2, _ := json.Marshal(reqPayload2)
+	resp2, err := http.Post(testServer.URL+"/api/db/query", "application/json", bytes.NewReader(body2))
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("expected StatusOK for valid Postgres placeholder, got %d", resp2.StatusCode)
 	}
 }

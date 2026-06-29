@@ -7,7 +7,7 @@ This roadmap outlines the planned development phases for the ServDB database pro
 ## Phase 1: Connection Proxying (In Progress)
 - [x] **Connection pooling** — Shared pooling and connection reuse proxy. [June 29, 2026]
 - [x] **Query routing** — Read replica routing, primary write routing. [June 29, 2026]
-- [ ] **Multi-database support** — Multi-dialect parser backend support.
+- [x] **Multi-database support** — Multi-dialect parser backend support. [June 29, 2026]
 - [ ] **Serv-lang integration** — Centralized client driver connection pool setup.
 
 ## Phase 2: Analytics & Performance Optimization

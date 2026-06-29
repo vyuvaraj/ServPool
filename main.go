@@ -25,10 +25,11 @@ type QueryResponse struct {
 }
 
 type PoolStats struct {
-	ActiveConnections int   `json:"active_connections"`
-	IdleConnections   int   `json:"idle_connections"`
-	MaxConnections    int   `json:"max_connections"`
-	TotalQueries      int64 `json:"total_queries"`
+	ActiveConnections int    `json:"active_connections"`
+	IdleConnections   int    `json:"idle_connections"`
+	MaxConnections    int    `json:"max_connections"`
+	TotalQueries      int64  `json:"total_queries"`
+	Dialect           string `json:"dialect"`
 }
 
 type StatsResponse struct {
@@ -49,13 +50,15 @@ type ConnectionPool struct {
 	idleConns    []*DbConn
 	totalQueries int64
 	nextConnID   int
+	dialect      string
 }
 
-func NewConnectionPool(max int) *ConnectionPool {
+func NewConnectionPool(max int, dialect string) *ConnectionPool {
 	return &ConnectionPool{
 		maxConns:    max,
 		activeConns: make(map[int]*DbConn),
 		idleConns:   make([]*DbConn, 0),
+		dialect:     dialect,
 	}
 }
 
@@ -110,6 +113,7 @@ func (p *ConnectionPool) Stats() PoolStats {
 		IdleConnections:   len(p.idleConns),
 		MaxConnections:    p.maxConns,
 		TotalQueries:      p.totalQueries,
+		Dialect:           p.dialect,
 	}
 }
 
@@ -121,6 +125,7 @@ var (
 func main() {
 	portStr := flag.String("port", "8097", "ServDB server port")
 	maxConns := flag.Int("max_conns", 10, "Maximum connection pool size")
+	dialectStr := flag.String("dialect", "postgres", "Database dialect (postgres, mysql)")
 	flag.Parse()
 
 	port := os.Getenv("PORT")
@@ -128,8 +133,8 @@ func main() {
 		port = *portStr
 	}
 
-	primaryPool = NewConnectionPool(*maxConns)
-	replicaPool = NewConnectionPool(*maxConns)
+	primaryPool = NewConnectionPool(*maxConns, *dialectStr)
+	replicaPool = NewConnectionPool(*maxConns, *dialectStr)
 
 	mux := http.NewServeMux()
 
@@ -176,6 +181,20 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 	} else {
 		targetPool = primaryPool
 		targetName = "primary"
+	}
+
+	// Dialect placeholder format safety validation
+	if targetPool.dialect == "postgres" && strings.Contains(req.Query, "?") {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"dialect_mismatch","message":"PostgreSQL dialect requires '$1' placeholders, found '?'"}`))
+		return
+	}
+	if targetPool.dialect == "mysql" && strings.Contains(req.Query, "$1") {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"dialect_mismatch","message":"MySQL dialect requires '?' placeholders, found '$1'"}`))
+		return
 	}
 
 	// Acquire mock pooled database connection handle
