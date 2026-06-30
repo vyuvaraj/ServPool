@@ -63,6 +63,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
 	})
+	mux.HandleFunc("/api/version", ServShared.VersionHandler("servdb", "1.0.0"))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
