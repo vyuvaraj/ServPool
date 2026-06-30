@@ -1,11 +1,13 @@
 package ServShared
 
 import (
+	"crypto/rsa"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -18,6 +20,8 @@ type ContextKey string
 const (
 	// ClaimsContextKey is the context key for authenticated claims.
 	ClaimsContextKey ContextKey = "servverse-claims"
+	// TenantContextKey is the context key for the verified tenant ID.
+	TenantContextKey ContextKey = "servverse-tenant-id"
 )
 
 // GetClaims extracts claims from request context (set by AuthMiddleware).
@@ -28,6 +32,15 @@ func GetClaims(r *http.Request) *Claims {
 	return nil
 }
 
+// GetTenantID extracts the verified tenant ID from request context (set by TenantMiddleware).
+// Always use this instead of reading X-Tenant-ID directly to ensure it has been verified.
+func GetTenantID(r *http.Request) string {
+	if tid, ok := r.Context().Value(TenantContextKey).(string); ok {
+		return tid
+	}
+	return ""
+}
+
 // AuthMiddleware returns an HTTP middleware that enforces JWT auth.
 //
 // Behavior:
@@ -36,11 +49,12 @@ func GetClaims(r *http.Request) *Claims {
 //   - /healthz and /readyz are always allowed without auth
 func AuthMiddleware(next http.Handler) http.Handler {
 	secret := os.Getenv("SERV_JWT_SECRET")
-	if secret == "" {
+	jwksURL := os.Getenv("SERV_JWKS_URL")
+	if secret == "" && jwksURL == "" {
 		return next // dev mode — no auth enforced
 	}
 
-	validator := NewAuthValidator(secret, "", "")
+	validator := NewAuthValidator(secret, jwksURL, "")
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Always allow health probes without auth
@@ -70,6 +84,44 @@ func AuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// TenantMiddleware enforces that the X-Tenant-ID request header matches the
+// tenant_id claim embedded in the verified JWT. This prevents callers from
+// impersonating tenants by forging the header.
+//
+// Behavior:
+//   - If no JWT is present in context (auth disabled / dev mode): falls back to
+//     X-Tenant-ID header value, defaulting to "default" if absent.
+//   - If JWT is present and has a tenant_id claim: X-Tenant-ID MUST match.
+//   - If JWT has no tenant_id claim (e.g. service tokens): X-Tenant-ID is
+//     accepted as-is (service tokens are implicitly trusted for any tenant).
+//   - The verified tenant ID is injected into context via TenantContextKey.
+func TenantMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headerTenant := r.Header.Get("X-Tenant-ID")
+		if headerTenant == "" {
+			headerTenant = "default"
+		}
+
+		claims := GetClaims(r)
+		verifiedTenant := headerTenant
+
+		if claims != nil && claims.TenantID != "" {
+			// Enforce: header must match JWT claim exactly.
+			if headerTenant != claims.TenantID {
+				writeAuthError(w, http.StatusForbidden,
+					"Forbidden: X-Tenant-ID does not match authenticated tenant",
+					"ERR_TENANT_MISMATCH")
+				return
+			}
+			verifiedTenant = claims.TenantID
+		}
+
+		// Inject verified tenant ID into context.
+		ctx := context.WithValue(r.Context(), TenantContextKey, verifiedTenant)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 // GenerateServiceToken creates a long-lived JWT for inter-service communication.
 // The token identifies the calling service and has the "service" role.
 func GenerateServiceToken(secret string, serviceName string) (string, error) {
@@ -93,11 +145,12 @@ func GenerateServiceToken(secret string, serviceName string) (string, error) {
 	return token.SignedString([]byte(secret))
 }
 
-// GenerateUserToken creates a JWT for a user with given roles.
-func GenerateUserToken(secret string, username string, roles []string, ttl time.Duration) (string, error) {
+// GenerateUserToken creates a JWT for a user with given roles and tenant.
+func GenerateUserToken(secret string, username string, roles []string, tenantID string, ttl time.Duration) (string, error) {
 	claims := Claims{
 		Username: username,
 		Roles:    roles,
+		TenantID: tenantID,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    "servverse",
 			Subject:   username,
@@ -108,6 +161,25 @@ func GenerateUserToken(secret string, username string, roles []string, ttl time.
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(secret))
+}
+
+// GenerateUserTokenRS256 creates a JWT signed with an RSA private key.
+func GenerateUserTokenRS256(privKey *rsa.PrivateKey, kid string, username string, roles []string, tenantID string, ttl time.Duration) (string, error) {
+	claims := Claims{
+		Username: username,
+		Roles:    roles,
+		TenantID: tenantID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "servverse",
+			Subject:   username,
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	token.Header["kid"] = kid
+	return token.SignedString(privKey)
 }
 
 // HasRole checks if the authenticated claims include a specific role.
@@ -187,7 +259,7 @@ func LogJSON(r *http.Request, level, msg string) {
 	entry := map[string]interface{}{
 		"level": level,
 		"ts":    time.Now().Format(time.RFC3339),
-		"msg":   msg,
+		"msg":   SanitizeLog(msg),
 	}
 	if r != nil {
 		entry["method"] = r.Method
@@ -203,3 +275,83 @@ func LogJSON(r *http.Request, level, msg string) {
 	data, _ := json.Marshal(entry)
 	fmt.Println(string(data))
 }
+
+// Validatable represents a request payload that can validate its own fields.
+type Validatable interface {
+	Validate() error
+}
+
+// DecodeAndValidateJSON decodes JSON from a request body and validates it.
+// It returns true on success, or false if it wrote an HTTP error response.
+func DecodeAndValidateJSON(w http.ResponseWriter, r *http.Request, dest Validatable) bool {
+	if err := json.NewDecoder(r.Body).Decode(dest); err != nil {
+		writeAuthError(w, http.StatusBadRequest, "Invalid JSON payload: "+err.Error(), "ERR_BAD_REQUEST")
+		return false
+	}
+	if err := dest.Validate(); err != nil {
+		writeAuthError(w, http.StatusBadRequest, "Validation failed: "+err.Error(), "ERR_VALIDATION_FAILED")
+		return false
+	}
+	return true
+}
+
+// MaxBytesMiddleware limits the size of the request body.
+func MaxBytesMiddleware(limit int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+var sanitizeRegex = regexp.MustCompile(`(?i)(password|secret|token|key|authorization|bearer|passwd)\s*[:=]\s*([^\s,"']+)`)
+
+// SanitizeLog redacts sensitive information from log messages.
+func SanitizeLog(msg string) string {
+	return sanitizeRegex.ReplaceAllString(msg, "$1:[REDACTED]")
+}
+
+// IsolateTopic prefixes a topic name with the tenant ID from context.
+func IsolateTopic(ctx context.Context, topic string) string {
+	if tid, ok := ctx.Value(TenantContextKey).(string); ok && tid != "" && tid != "default" {
+		return tid + "-" + topic
+	}
+	return topic
+}
+
+// IsolateDBPool prefixes database name with the tenant ID from context.
+func IsolateDBPool(ctx context.Context, dbName string) string {
+	if tid, ok := ctx.Value(TenantContextKey).(string); ok && tid != "" && tid != "default" {
+		return tid + "_" + dbName
+	}
+	return dbName
+}
+
+// VersionHandler returns a JSON version response.
+func VersionHandler(serviceName, version string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"service": serviceName,
+			"version": version,
+		})
+	}
+}
+
+// DeprecationMiddleware adds Deprecation and Sunset headers to response.
+func DeprecationMiddleware(sunsetDate string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Deprecation", "true")
+			if sunsetDate != "" {
+				w.Header().Set("Sunset", sunsetDate)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+
+

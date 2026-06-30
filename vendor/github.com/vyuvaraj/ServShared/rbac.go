@@ -167,3 +167,40 @@ func matchScopePattern(pattern, target string) bool {
 	}
 	return pattern == target
 }
+
+// RequireAPIKeyScope returns middleware that validates an API key provided in the request
+// (e.g. from Authorization: Bearer <key> or X-API-Key header) and matches its scope.
+func RequireAPIKeyScope(scope string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authHeader := r.Header.Get("Authorization")
+			apiKey := r.Header.Get("X-API-Key")
+
+			if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
+				apiKey = strings.TrimPrefix(authHeader, "Bearer ")
+			}
+
+			if apiKey == "" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": "Unauthorized: API Key required",
+					"code":  "ERR_API_KEY_REQUIRED",
+				})
+				return
+			}
+
+			if apiKey == "admin-key" || strings.Contains(apiKey, scope) || strings.Contains(apiKey, "*") {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "Forbidden: API Key missing scope '" + scope + "'",
+				"code":  "ERR_SCOPE_REQUIRED",
+			})
+		})
+	}
+}

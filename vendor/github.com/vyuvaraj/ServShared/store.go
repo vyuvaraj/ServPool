@@ -2,9 +2,12 @@ package ServShared
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -30,6 +33,24 @@ func NewStoreClient() *StoreClient {
 		Endpoint:  strings.TrimSuffix(endpoint, "/"),
 		AuthToken: authToken,
 	}
+}
+
+// IsolateBucket prefixes bucket name with the tenant ID from context.
+func (c *StoreClient) IsolateBucket(ctx context.Context, bucket string) string {
+	if tid, ok := ctx.Value(TenantContextKey).(string); ok && tid != "" && tid != "default" {
+		return tid + "-" + bucket
+	}
+	return bucket
+}
+
+// PutCtx writes object data to a tenant-isolated bucket.
+func (c *StoreClient) PutCtx(ctx context.Context, bucket, key string, data []byte) error {
+	return c.Put(c.IsolateBucket(ctx, bucket), key, data)
+}
+
+// GetCtx reads object data from a tenant-isolated bucket.
+func (c *StoreClient) GetCtx(ctx context.Context, bucket, key string) ([]byte, error) {
+	return c.Get(c.IsolateBucket(ctx, bucket), key)
 }
 
 // EnsureBucket creates a bucket in ServStore if it does not already exist.
@@ -100,4 +121,34 @@ func (c *StoreClient) Get(bucket, key string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read from ServStore (%d): %s", resp.StatusCode, string(body))
 	}
 	return io.ReadAll(resp.Body)
+}
+
+// SemanticSearch runs a vector similarity/semantic search query on a bucket in ServStore.
+func (c *StoreClient) SemanticSearch(bucket, query string, limit int) ([]string, error) {
+	searchURL := fmt.Sprintf("%s/api/v1/search?bucket=%s&q=%s&limit=%d", c.Endpoint, bucket, url.QueryEscape(query), limit)
+	req, err := http.NewRequest("GET", searchURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.AuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.AuthToken)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("search failed (%d): %s", resp.StatusCode, string(body))
+	}
+
+	var results []string
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
