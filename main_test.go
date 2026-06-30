@@ -7,9 +7,28 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 )
 
+func setupTest() {
+	primaryPool = NewConnectionPool(10, "postgres")
+	replicaPool = NewConnectionPool(10, "postgres")
+
+	analyticsMu.Lock()
+	queryAnalytics = make(map[string]*QueryMetric)
+	analyticsMu.Unlock()
+
+	migrationsMu.Lock()
+	migrations = make([]Migration, 0)
+	migrationsMu.Unlock()
+
+	queryCacheMu.Lock()
+	queryCache = make(map[string]CachedResult)
+	queryCacheMu.Unlock()
+}
+
 func TestServDBConnectionPoolingAndRouting(t *testing.T) {
+	setupTest()
 	primaryPool = NewConnectionPool(3, "postgres")
 	replicaPool = NewConnectionPool(3, "postgres")
 
@@ -83,6 +102,7 @@ func TestServDBConnectionPoolingAndRouting(t *testing.T) {
 }
 
 func TestServDBDialectValidation(t *testing.T) {
+	setupTest()
 	// Configure with PostgreSQL dialect
 	primaryPool = NewConnectionPool(1, "postgres")
 	replicaPool = NewConnectionPool(1, "postgres")
@@ -121,6 +141,7 @@ func TestServDBDialectValidation(t *testing.T) {
 }
 
 func TestServDBSlowQueryAndAnalytics(t *testing.T) {
+	setupTest()
 	primaryPool = NewConnectionPool(1, "postgres")
 	replicaPool = NewConnectionPool(1, "postgres")
 
@@ -169,6 +190,7 @@ func TestServDBSlowQueryAndAnalytics(t *testing.T) {
 }
 
 func TestServDBMigrations(t *testing.T) {
+	setupTest()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/db/migrate", handleMigrate)
 
@@ -224,6 +246,7 @@ func TestServDBMigrations(t *testing.T) {
 }
 
 func TestServDBQueryCaching(t *testing.T) {
+	setupTest()
 	primaryPool = NewConnectionPool(5, "postgres")
 	replicaPool = NewConnectionPool(5, "postgres")
 
@@ -293,6 +316,7 @@ func TestServDBQueryCaching(t *testing.T) {
 }
 
 func TestServDBHealth(t *testing.T) {
+	setupTest()
 	primaryPool = NewConnectionPool(2, "postgres")
 	replicaPool = NewConnectionPool(2, "postgres")
 
@@ -328,5 +352,65 @@ func TestServDBHealth(t *testing.T) {
 
 	if res2["deadlock_alert"].(bool) != true {
 		t.Errorf("expected deadlock alert to be true when pool is full, got false")
+	}
+}
+
+func TestTableDrivenQueryValidation(t *testing.T) {
+	setupTest()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/db/query", handleQuery)
+	testServer := httptest.NewServer(mux)
+	defer testServer.Close()
+
+	tests := []struct {
+		name       string
+		query      string
+		wantStatus int
+	}{
+		{
+			name:       "Empty Query",
+			query:      "",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "Postgres Placeholder Mismatch",
+			query:      "SELECT * FROM users WHERE id = ?;",
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reqPayload := QueryRequest{Query: tt.query}
+			body, _ := json.Marshal(reqPayload)
+			resp, err := http.Post(testServer.URL+"/api/db/query", "application/json", bytes.NewReader(body))
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("expected status %d, got %d", tt.wantStatus, resp.StatusCode)
+			}
+		})
+	}
+}
+
+func BenchmarkQueryCacheLookup(b *testing.B) {
+	// Pre-populate cache
+	queryCacheMu.Lock()
+	queryCache["SELECT * FROM users;"] = CachedResult{
+		Rows:      []map[string]interface{}{{"id": 1}},
+		CachedAt:  time.Now(),
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+	}
+	queryCacheMu.Unlock()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		queryCacheMu.RLock()
+		_, _ = queryCache["SELECT * FROM users;"]
+		queryCacheMu.RUnlock()
 	}
 }
