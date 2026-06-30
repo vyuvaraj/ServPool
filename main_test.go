@@ -10,21 +10,70 @@ import (
 	"time"
 )
 
+var (
+	testSrv        *Server
+	primaryPool    *ConnectionPool
+	replicaPool    *ConnectionPool
+	queryAnalytics = make(map[string]*QueryMetric)
+	analyticsMu    sync.RWMutex
+	migrations     = make([]Migration, 0)
+	migrationsMu   sync.RWMutex
+	queryCache     = make(map[string]CachedResult)
+	queryCacheMu   sync.RWMutex
+)
+
 func setupTest() {
 	primaryPool = NewConnectionPool(10, "postgres")
 	replicaPool = NewConnectionPool(10, "postgres")
-
-	analyticsMu.Lock()
 	queryAnalytics = make(map[string]*QueryMetric)
-	analyticsMu.Unlock()
-
-	migrationsMu.Lock()
 	migrations = make([]Migration, 0)
-	migrationsMu.Unlock()
-
-	queryCacheMu.Lock()
 	queryCache = make(map[string]CachedResult)
-	queryCacheMu.Unlock()
+	testSrv = NewServer(primaryPool, replicaPool, nil)
+	testSrv.queryAnalytics = queryAnalytics
+	testSrv.migrations = migrations
+	testSrv.queryCache = queryCache
+}
+
+func handleQuery(w http.ResponseWriter, r *http.Request) {
+	testSrv.primaryPool = primaryPool
+	testSrv.replicaPool = replicaPool
+	testSrv.queryAnalytics = queryAnalytics
+	testSrv.migrations = migrations
+	testSrv.queryCache = queryCache
+	testSrv.handleQuery(w, r)
+	queryAnalytics = testSrv.queryAnalytics
+	migrations = testSrv.migrations
+	queryCache = testSrv.queryCache
+}
+
+func handleStats(w http.ResponseWriter, r *http.Request) {
+	testSrv.primaryPool = primaryPool
+	testSrv.replicaPool = replicaPool
+	testSrv.handleStats(w, r)
+}
+
+func handleAnalytics(w http.ResponseWriter, r *http.Request) {
+	testSrv.queryAnalytics = queryAnalytics
+	testSrv.handleAnalytics(w, r)
+	queryAnalytics = testSrv.queryAnalytics
+}
+
+func handleMigrate(w http.ResponseWriter, r *http.Request) {
+	testSrv.migrations = migrations
+	testSrv.handleMigrate(w, r)
+	migrations = testSrv.migrations
+}
+
+func handleClearCache(w http.ResponseWriter, r *http.Request) {
+	testSrv.queryCache = queryCache
+	testSrv.handleClearCache(w, r)
+	queryCache = testSrv.queryCache
+}
+
+func handleDbHealth(w http.ResponseWriter, r *http.Request) {
+	testSrv.primaryPool = primaryPool
+	testSrv.replicaPool = replicaPool
+	testSrv.handleDbHealth(w, r)
 }
 
 func TestServDBConnectionPoolingAndRouting(t *testing.T) {
