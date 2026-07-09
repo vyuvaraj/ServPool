@@ -45,6 +45,7 @@ func main() {
 	maxConns := flag.Int("max_conns", 10, "Maximum connection pool size")
 	dialectStr := flag.String("dialect", "postgres", "Database dialect (postgres, mysql)")
 	peersStr := flag.String("peers", "", "Comma-separated list of database peer addresses")
+	regionReplicasStr := flag.String("region-replicas", "", "Comma-separated list of region names to create local replica pools for (e.g. us-east,us-west)")
 	flag.Parse()
 
 	port := os.Getenv("PORT")
@@ -58,6 +59,22 @@ func main() {
 	storeClient := ServShared.NewStoreClient()
 
 	srv := NewServer(primaryPool, replicaPool, storeClient)
+
+	var regionReplicas []string
+	if *regionReplicasStr != "" {
+		regionReplicas = strings.Split(*regionReplicasStr, ",")
+	} else if envRegions := os.Getenv("SERVDB_REGION_REPLICAS"); envRegions != "" {
+		regionReplicas = strings.Split(envRegions, ",")
+	}
+
+	for _, region := range regionReplicas {
+		region = strings.TrimSpace(region)
+		if region != "" {
+			regPool := NewConnectionPool(*maxConns, *dialectStr)
+			srv.AddRegionPool(region, regPool)
+			log.Printf("[INFO] Initialized regional replica pool for region %s", region)
+		}
+	}
 
 	var peers []string
 	if *peersStr != "" {
@@ -114,7 +131,12 @@ func main() {
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("Server shutdown failed: %v", err)
+		log.Printf("[WARN] Server shutdown failed: %v", err)
 	}
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("[WARN] Connection pools draining failed: %v", err)
+	}
+
 	log.Println("[INFO] ServDB server exited cleanly")
 }

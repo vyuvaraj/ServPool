@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -642,6 +643,147 @@ func TestDatabaseMigrationsRollback(t *testing.T) {
 	srv.activeTablesMu.RUnlock()
 	if hasCustomersAfterRb {
 		t.Errorf("expected 'customers' table to be untracked after rollback")
+	}
+}
+
+func TestServDBConnectionDraining(t *testing.T) {
+	pool := NewConnectionPool(2, "postgres")
+	
+	// Acquire a connection to keep it active
+	conn, err := pool.Acquire()
+	if err != nil {
+		t.Fatalf("failed to acquire connection: %v", err)
+	}
+
+	// Trigger shutdown in a goroutine
+	shutdownErr := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	go func() {
+		shutdownErr <- pool.Shutdown(ctx)
+	}()
+
+	// Wait a bit to ensure it blocks since connection is active
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-shutdownErr:
+		t.Fatalf("expected Shutdown to block, but it returned early: %v", err)
+	default:
+		// Working as expected, it's blocking
+	}
+
+	// Release the active connection
+	pool.Release(conn)
+
+	// Now it should complete successfully
+	select {
+	case err := <-shutdownErr:
+		if err != nil {
+			t.Errorf("expected no error from Shutdown after release, got: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("timed out waiting for Shutdown to complete after release")
+	}
+}
+
+func TestServDBMultiRegionRouting(t *testing.T) {
+	primaryPool := NewConnectionPool(2, "postgres")
+	replicaPool := NewConnectionPool(2, "postgres")
+	srv := NewServer(primaryPool, replicaPool, nil)
+
+	usEastPool := NewConnectionPool(2, "postgres")
+	euWestPool := NewConnectionPool(2, "postgres")
+
+	srv.AddRegionPool("us-east", usEastPool)
+	srv.AddRegionPool("eu-west", euWestPool)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/db/query", srv.handleQuery)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// 1. SELECT query with X-Region: us-east
+	reqPayload := QueryRequest{Query: "SELECT * FROM users;"}
+	body, _ := json.Marshal(reqPayload)
+	req, _ := http.NewRequest("POST", server.URL+"/api/db/query", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Region", "us-east")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var res map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&res)
+	rows := res["rows"].([]interface{})
+	row0 := rows[0].(map[string]interface{})
+	if row0["pool"] != "replica-us-east" {
+		t.Errorf("expected query to route to 'replica-us-east', got %v", row0["pool"])
+	}
+
+	// 2. SELECT query with X-Region: eu-west
+	reqPayload2 := QueryRequest{Query: "SELECT * FROM users;"}
+	body2, _ := json.Marshal(reqPayload2)
+	req2, _ := http.NewRequest("POST", server.URL+"/api/db/query", bytes.NewReader(body2))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("X-Region", "eu-west")
+
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	var res2 map[string]interface{}
+	json.NewDecoder(resp2.Body).Decode(&res2)
+	rows2 := res2["rows"].([]interface{})
+	row02 := rows2[0].(map[string]interface{})
+	if row02["pool"] != "replica-eu-west" {
+		t.Errorf("expected query to route to 'replica-eu-west', got %v", row02["pool"])
+	}
+
+	// 3. SELECT query with missing X-Region (defaults to replica)
+	reqPayload3 := QueryRequest{Query: "SELECT * FROM users;"}
+	body3, _ := json.Marshal(reqPayload3)
+	req3, _ := http.NewRequest("POST", server.URL+"/api/db/query", bytes.NewReader(body3))
+	req3.Header.Set("Content-Type", "application/json")
+
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp3.Body.Close()
+
+	var res3 map[string]interface{}
+	json.NewDecoder(resp3.Body).Decode(&res3)
+	rows3 := res3["rows"].([]interface{})
+	row03 := rows3[0].(map[string]interface{})
+	if row03["pool"] != "replica" {
+		t.Errorf("expected query to route to default 'replica', got %v", row03["pool"])
+	}
+
+	// 4. Non-SELECT query (routes to primary regardless of region)
+	reqPayload4 := QueryRequest{Query: "INSERT INTO users VALUES (1);"}
+	body4, _ := json.Marshal(reqPayload4)
+	req4, _ := http.NewRequest("POST", server.URL+"/api/db/query", bytes.NewReader(body4))
+	req4.Header.Set("Content-Type", "application/json")
+	req4.Header.Set("X-Region", "us-east")
+
+	resp4, err := http.DefaultClient.Do(req4)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp4.Body.Close()
+
+	var res4 map[string]interface{}
+	json.NewDecoder(resp4.Body).Decode(&res4)
+	rows4 := res4["rows"].([]interface{})
+	row04 := rows4[0].(map[string]interface{})
+	if row04["pool"] != "primary" {
+		t.Errorf("expected non-select query to route to 'primary', got %v", row04["pool"])
 	}
 }
 

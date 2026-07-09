@@ -45,8 +45,8 @@ This roadmap outlines the planned development phases for the ServDB database pro
 ## Phase 5: Advanced Database Proxy (Pending)
 - [ ] **Prepared Statement Multiplexing** — Share prepared statements across connections in the pool to reduce DB-side overhead
 - [ ] **Query Result Caching (Cache-Aside)** — Intercept SELECT queries and serve from ServCache with automatic invalidation on matching INSERT/UPDATE/DELETE
-- [ ] **Connection Draining** — Gracefully drain connections during rolling deploys; wait for in-flight queries before closing
+- [x] **Connection Draining** — Gracefully drain connections during rolling deploys; wait for in-flight queries before closing
 - [ ] **Declarative Schema Migrations DSL** — Native `.srv` syntax for schema definitions compiled to migration SQL (DX.14)
-- [ ] **Multi-region Query Routing** — Route reads to geo-local replicas based on request origin metadata
+- [x] **Multi-region Query Routing** — Route reads to geo-local replicas based on request origin metadata
 
 > See [UNIFIED_ROADMAP.md](../servverse-repo/UNIFIED_ROADMAP.md) for the full ecosystem priority matrix.

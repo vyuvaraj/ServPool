@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +15,9 @@ import (
 type Server struct {
 	primaryPool PoolManager
 	replicaPool PoolManager
+
+	regionPools   map[string]PoolManager
+	regionPoolsMu sync.RWMutex
 
 	storeClient *ServShared.StoreClient
 
@@ -37,6 +41,7 @@ func NewServer(primary, replica PoolManager, store *ServShared.StoreClient) *Ser
 	srv := &Server{
 		primaryPool:    primary,
 		replicaPool:    replica,
+		regionPools:    make(map[string]PoolManager),
 		storeClient:    store,
 		queryAnalytics: make(map[string]*QueryMetric),
 		migrations:     make([]Migration, 0),
@@ -46,6 +51,35 @@ func NewServer(primary, replica PoolManager, store *ServShared.StoreClient) *Ser
 	}
 	srv.loadMigrationsFromStore()
 	return srv
+}
+
+func (srv *Server) AddRegionPool(region string, pool PoolManager) {
+	srv.regionPoolsMu.Lock()
+	defer srv.regionPoolsMu.Unlock()
+	srv.regionPools[region] = pool
+}
+
+func (srv *Server) Shutdown(ctx context.Context) error {
+	var errs []string
+	if err := srv.primaryPool.Shutdown(ctx); err != nil {
+		errs = append(errs, fmt.Sprintf("primary pool shutdown error: %v", err))
+	}
+	if err := srv.replicaPool.Shutdown(ctx); err != nil {
+		errs = append(errs, fmt.Sprintf("replica pool shutdown error: %v", err))
+	}
+
+	srv.regionPoolsMu.RLock()
+	for region, pool := range srv.regionPools {
+		if err := pool.Shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Sprintf("region pool %s shutdown error: %v", region, err))
+		}
+	}
+	srv.regionPoolsMu.RUnlock()
+
+	if len(errs) > 0 {
+		return fmt.Errorf("shutdown errors: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 func (srv *Server) loadMigrationsFromStore() {
@@ -94,8 +128,20 @@ func (srv *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	var targetPool PoolManager
 	var targetName string
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(req.Query)), "SELECT") {
-		targetPool = srv.replicaPool
-		targetName = "replica"
+		region := r.Header.Get("X-Region")
+		if region != "" {
+			srv.regionPoolsMu.RLock()
+			regPool, exists := srv.regionPools[region]
+			srv.regionPoolsMu.RUnlock()
+			if exists {
+				targetPool = regPool
+				targetName = "replica-" + region
+			}
+		}
+		if targetPool == nil {
+			targetPool = srv.replicaPool
+			targetName = "replica"
+		}
 	} else {
 		targetPool = srv.primaryPool
 		targetName = "primary"

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ type PoolManager interface {
 	IncrementQueries()
 	Stats() PoolStats
 	Dialect() string
+	Shutdown(ctx context.Context) error
 }
 
 type ConnectionPool struct {
@@ -38,6 +40,8 @@ type ConnectionPool struct {
 	dialect      string
 	maxLifetime  time.Duration
 	lastActive   time.Time
+	shutdownChan chan struct{}
+	isShutdown   bool
 }
 
 func NewConnectionPool(max int, dialect string) *ConnectionPool {
@@ -49,6 +53,7 @@ func NewConnectionPool(max int, dialect string) *ConnectionPool {
 		dialect:      dialect,
 		maxLifetime:  5 * time.Second, // Max lifetime for connection invalidation (short for tests)
 		lastActive:   time.Now(),
+		shutdownChan: make(chan struct{}),
 	}
 
 	// Start background janitor to clean up expired idle connections and scale down pool
@@ -63,32 +68,42 @@ func (p *ConnectionPool) Dialect() string {
 
 func (p *ConnectionPool) startPoolJanitor(interval time.Duration) {
 	ticker := time.NewTicker(interval)
-	for range ticker.C {
-		p.mu.Lock()
-		now := time.Now()
-		
-		// 1. Invalidate stale idle connections
-		var freshIdle []*DbConn
-		for _, conn := range p.idleConns {
-			if now.Sub(conn.CreatedAt) <= p.maxLifetime {
-				freshIdle = append(freshIdle, conn)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			p.mu.Lock()
+			now := time.Now()
+			
+			// 1. Invalidate stale idle connections
+			var freshIdle []*DbConn
+			for _, conn := range p.idleConns {
+				if now.Sub(conn.CreatedAt) <= p.maxLifetime {
+					freshIdle = append(freshIdle, conn)
+				}
 			}
-		}
-		p.idleConns = freshIdle
+			p.idleConns = freshIdle
 
-		// 2. Shrink pool limit back to baseMaxConns if idle for a cooldown period
-		if len(p.activeConns) < p.baseMaxConns/2 && p.maxConns > p.baseMaxConns {
-			if now.Sub(p.lastActive) > 1*time.Second { // Cooldown for scaling down (short for tests)
-				p.maxConns = p.baseMaxConns
+			// 2. Shrink pool limit back to baseMaxConns if idle for a cooldown period
+			if len(p.activeConns) < p.baseMaxConns/2 && p.maxConns > p.baseMaxConns {
+				if now.Sub(p.lastActive) > 1*time.Second { // Cooldown for scaling down (short for tests)
+					p.maxConns = p.baseMaxConns
+				}
 			}
+			p.mu.Unlock()
+		case <-p.shutdownChan:
+			return
 		}
-		p.mu.Unlock()
 	}
 }
 
 func (p *ConnectionPool) Acquire() (*DbConn, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if p.isShutdown {
+		return nil, errors.New("connection pool is shutting down")
+	}
 
 	p.lastActive = time.Now()
 
@@ -148,5 +163,35 @@ func (p *ConnectionPool) Stats() PoolStats {
 		MaxConnections:    p.maxConns,
 		TotalQueries:      p.totalQueries,
 		Dialect:           p.dialect,
+	}
+}
+
+func (p *ConnectionPool) Shutdown(ctx context.Context) error {
+	p.mu.Lock()
+	if p.isShutdown {
+		p.mu.Unlock()
+		return nil
+	}
+	p.isShutdown = true
+	close(p.shutdownChan)
+	p.mu.Unlock()
+
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		p.mu.Lock()
+		activeCount := len(p.activeConns)
+		p.mu.Unlock()
+
+		if activeCount == 0 {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
