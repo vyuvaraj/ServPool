@@ -109,6 +109,7 @@ func main() {
 	mux.HandleFunc("/api/db/migrate", srv.handleMigrate)
 	mux.HandleFunc("/api/db/cache/clear", srv.handleClearCache)
 	mux.HandleFunc("/api/db/health", srv.handleDbHealth)
+	mux.HandleFunc("/metrics", srv.handlePrometheusMetrics)
 
 	serverHandler := ServShared.TraceMiddleware("servdb", ServShared.AuthMiddleware(mux))
 

@@ -449,3 +449,47 @@ func (srv *Server) handleDbHealth(w http.ResponseWriter, r *http.Request) {
 		"active_leases":  primaryStats.ActiveConnections + replicaStats.ActiveConnections,
 	})
 }
+
+func (srv *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	type poolEntry struct {
+		label string
+		stats PoolStats
+	}
+
+	pools := []poolEntry{
+		{"primary", srv.primaryPool.Stats()},
+		{"replica", srv.replicaPool.Stats()},
+	}
+
+	srv.regionPoolsMu.RLock()
+	for region, pool := range srv.regionPools {
+		pools = append(pools, poolEntry{"region_" + region, pool.Stats()})
+	}
+	srv.regionPoolsMu.RUnlock()
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+
+	for _, p := range pools {
+		lbl := fmt.Sprintf(`pool="%s"`, p.label)
+		fmt.Fprintf(w, "# HELP servdb_pool_active_connections Active connections in pool.\n")
+		fmt.Fprintf(w, "# TYPE servdb_pool_active_connections gauge\n")
+		fmt.Fprintf(w, "servdb_pool_active_connections{%s} %d\n\n", lbl, p.stats.ActiveConnections)
+
+		fmt.Fprintf(w, "# HELP servdb_pool_idle_connections Idle connections waiting in pool.\n")
+		fmt.Fprintf(w, "# TYPE servdb_pool_idle_connections gauge\n")
+		fmt.Fprintf(w, "servdb_pool_idle_connections{%s} %d\n\n", lbl, p.stats.IdleConnections)
+
+		fmt.Fprintf(w, "# HELP servdb_pool_max_connections Maximum allowed connections for pool.\n")
+		fmt.Fprintf(w, "# TYPE servdb_pool_max_connections gauge\n")
+		fmt.Fprintf(w, "servdb_pool_max_connections{%s} %d\n\n", lbl, p.stats.MaxConnections)
+
+		fmt.Fprintf(w, "# HELP servdb_pool_total_queries_total Total queries processed by pool.\n")
+		fmt.Fprintf(w, "# TYPE servdb_pool_total_queries_total counter\n")
+		fmt.Fprintf(w, "servdb_pool_total_queries_total{%s} %d\n\n", lbl, p.stats.TotalQueries)
+	}
+}
