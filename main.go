@@ -12,35 +12,11 @@ import (
 	"time"
 
 	"github.com/vyuvaraj/ServShared"
+	"servdb/pkg/pool"
+	"servdb/pkg/routing"
 )
 
-type QueryMetric struct {
-	Count        int64 `json:"count"`
-	TotalLatency int64 `json:"total_latency_ms"`
-}
-
-type CachedResult struct {
-	Rows      []map[string]interface{} `json:"rows"`
-	CachedAt  time.Time                `json:"cached_at"`
-	ExpiresAt time.Time                `json:"expires_at"`
-}
-
-type QueryRequest struct {
-	Query string `json:"query"`
-}
-
-type QueryResponse struct {
-	Status   string                   `json:"status"`
-	Rows     []map[string]interface{} `json:"rows,omitempty"`
-	Duration int64                    `json:"duration_ms"`
-}
-
-type StatsResponse struct {
-	Primary PoolStats `json:"primary"`
-	Replica PoolStats `json:"replica"`
-}
-
-// Enterprise hooks (overridden in EE build)
+// Enterprise hooks (overridden in EE build).
 var (
 	EnterpriseListenAndServeTLS = func(srv *http.Server, certFile, keyFile string) error { return nil }
 )
@@ -58,12 +34,12 @@ func main() {
 		port = *portStr
 	}
 
-	primaryPool := NewConnectionPool(*maxConns, *dialectStr)
-	replicaPool := NewConnectionPool(*maxConns, *dialectStr)
+	primaryPool := pool.NewConnectionPool(*maxConns, *dialectStr)
+	replicaPool := pool.NewConnectionPool(*maxConns, *dialectStr)
 
 	storeClient := ServShared.NewStoreClient()
 
-	srv := NewServer(primaryPool, replicaPool, storeClient)
+	srv := routing.NewServer(primaryPool, replicaPool, storeClient)
 
 	var regionReplicas []string
 	if *regionReplicasStr != "" {
@@ -71,11 +47,10 @@ func main() {
 	} else if envRegions := os.Getenv("SERVDB_REGION_REPLICAS"); envRegions != "" {
 		regionReplicas = strings.Split(envRegions, ",")
 	}
-
 	for _, region := range regionReplicas {
 		region = strings.TrimSpace(region)
 		if region != "" {
-			regPool := NewConnectionPool(*maxConns, *dialectStr)
+			regPool := pool.NewConnectionPool(*maxConns, *dialectStr)
 			srv.AddRegionPool(region, regPool)
 			log.Printf("[INFO] Initialized regional replica pool for region %s", region)
 		}
@@ -93,7 +68,6 @@ func main() {
 	srv.SetPeers(peers)
 
 	mux := http.NewServeMux()
-
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
@@ -103,13 +77,13 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
-	mux.HandleFunc("/api/db/query", srv.handleQuery)
-	mux.HandleFunc("/api/db/stats", srv.handleStats)
-	mux.HandleFunc("/api/db/analytics", srv.handleAnalytics)
-	mux.HandleFunc("/api/db/migrate", srv.handleMigrate)
-	mux.HandleFunc("/api/db/cache/clear", srv.handleClearCache)
-	mux.HandleFunc("/api/db/health", srv.handleDbHealth)
-	mux.HandleFunc("/metrics", srv.handlePrometheusMetrics)
+	mux.HandleFunc("/api/db/query", srv.HandleQuery)
+	mux.HandleFunc("/api/db/stats", srv.HandleStats)
+	mux.HandleFunc("/api/db/analytics", srv.HandleAnalytics)
+	mux.HandleFunc("/api/db/migrate", srv.HandleMigrate)
+	mux.HandleFunc("/api/db/cache/clear", srv.HandleClearCache)
+	mux.HandleFunc("/api/db/health", srv.HandleDbHealth)
+	mux.HandleFunc("/metrics", srv.HandlePrometheusMetrics)
 
 	serverHandler := ServShared.TraceMiddleware("servdb", ServShared.AuthMiddleware(mux))
 
