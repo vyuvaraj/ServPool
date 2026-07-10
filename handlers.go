@@ -111,6 +111,13 @@ func (srv *Server) saveMigrationsToStore() {
 	}
 }
 
+// Enterprise hooks (overridden in EE build)
+var (
+	EnterpriseRouteQuery = func(srv *Server, query string, region string) (PoolManager, string) {
+		return nil, ""
+	}
+)
+
 func (srv *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -127,21 +134,10 @@ func (srv *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	var targetPool PoolManager
 	var targetName string
-	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(req.Query)), "SELECT") {
-		region := r.Header.Get("X-Region")
-		if region != "" {
-			srv.regionPoolsMu.RLock()
-			regPool, exists := srv.regionPools[region]
-			srv.regionPoolsMu.RUnlock()
-			if exists {
-				targetPool = regPool
-				targetName = "replica-" + region
-			}
-		}
-		if targetPool == nil {
-			targetPool = srv.replicaPool
-			targetName = "replica"
-		}
+
+	if ep, name := EnterpriseRouteQuery(srv, req.Query, r.Header.Get("X-Region")); ep != nil {
+		targetPool = ep
+		targetName = name
 	} else {
 		targetPool = srv.primaryPool
 		targetName = "primary"
