@@ -1,6 +1,10 @@
-# ServDB
+# ServPool
 
-ServDB is a database connection pooler and query routing proxy service of the Servverse ecosystem.
+```bash
+docker run -p 8087:8087 ghcr.io/vyuvaraj/servpool:latest
+```
+
+ServPool is a database connection pooler and query routing proxy service of the Servverse ecosystem.
 
 ## Features
 - **Connection Pooling**: Multiplexes and manages active pooled database connections to reduce startup overhead.
