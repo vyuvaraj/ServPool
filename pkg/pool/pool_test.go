@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestNewConnectionPoolPostgres(t *testing.T) {
@@ -100,5 +101,64 @@ func TestConnectionPoolCapacity(t *testing.T) {
 	defer p.Shutdown(context.Background())
 	if p.Dialect() != "sqlite" {
 		t.Errorf("expected sqlite dialect, got %s", p.Dialect())
+	}
+}
+
+func TestPoolExhaustionAndRecovery(t *testing.T) {
+	p := NewConnectionPool(1, "sqlite")
+	defer p.Shutdown(context.Background())
+
+	// Acquire 2 connections (base size 1, adaptively scales to 2)
+	c1, err := p.Acquire()
+	if err != nil {
+		t.Fatalf("failed to acquire c1: %v", err)
+	}
+	c2, err := p.Acquire()
+	if err != nil {
+		t.Fatalf("failed to acquire c2: %v", err)
+	}
+
+	// 3rd acquire blocks in wait queue
+	acquiredChan := make(chan *DbConn, 1)
+	errChan := make(chan error, 1)
+	go func() {
+		conn, err := p.Acquire()
+		if err != nil {
+			errChan <- err
+		} else {
+			acquiredChan <- conn
+		}
+	}()
+
+	// Wait briefly and verify it is indeed blocked
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-acquiredChan:
+		t.Fatal("expected 3rd acquire to block, but it completed")
+	case err := <-errChan:
+		t.Fatalf("expected 3rd acquire to block, but it failed: %v", err)
+	default:
+		// Correct: blocked
+	}
+
+	// Release c1, should unblock the 3rd acquire immediately
+	p.Release(c1)
+
+	var c3 *DbConn
+	select {
+	case c3 = <-acquiredChan:
+		if c3.ID != c1.ID {
+			t.Errorf("expected to receive released connection ID %d, got %d", c1.ID, c3.ID)
+		}
+	case err := <-errChan:
+		t.Fatalf("acquire failed after release: %v", err)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for 3rd acquire to unblock")
+	}
+
+	// Clean up
+	p.Release(c2)
+	if c3 != nil {
+		p.Release(c3)
 	}
 }

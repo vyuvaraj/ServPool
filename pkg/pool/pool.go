@@ -48,6 +48,7 @@ type ConnectionPool struct {
 	lastActive   time.Time
 	shutdownChan chan struct{}
 	isShutdown   bool
+	waitQueue    []chan *DbConn
 }
 
 // NewConnectionPool creates and starts a new ConnectionPool.
@@ -61,6 +62,7 @@ func NewConnectionPool(max int, dialect string) *ConnectionPool {
 		maxLifetime:  5 * time.Second,
 		lastActive:   time.Now(),
 		shutdownChan: make(chan struct{}),
+		waitQueue:    make([]chan *DbConn, 0),
 	}
 	go p.startPoolJanitor(100 * time.Millisecond)
 	return p
@@ -72,8 +74,8 @@ func (p *ConnectionPool) Dialect() string { return p.dialect }
 // Primarily useful in tests to shorten lifetimes.
 func (p *ConnectionPool) SetMaxLifetime(d time.Duration) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.maxLifetime = d
+	p.mu.Unlock()
 }
 
 func (p *ConnectionPool) startPoolJanitor(interval time.Duration) {
@@ -124,9 +126,9 @@ func (p *ConnectionPool) startPoolJanitor(interval time.Duration) {
 
 func (p *ConnectionPool) Acquire() (*DbConn, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	if p.isShutdown {
+		p.mu.Unlock()
 		return nil, errors.New("connection pool is shutting down")
 	}
 	p.lastActive = time.Now()
@@ -140,6 +142,7 @@ func (p *ConnectionPool) Acquire() (*DbConn, error) {
 		}
 		conn.CheckedOutAt = time.Now()
 		p.activeConns[conn.ID] = conn
+		p.mu.Unlock()
 		return conn, nil
 	}
 
@@ -157,15 +160,61 @@ func (p *ConnectionPool) Acquire() (*DbConn, error) {
 			CheckedOutAt: time.Now(),
 		}
 		p.activeConns[conn.ID] = conn
+		p.mu.Unlock()
 		return conn, nil
 	}
 
-	return nil, errors.New("connection pool exhausted")
+	// Wait queue: block until a connection is released
+	ch := make(chan *DbConn, 1)
+	p.waitQueue = append(p.waitQueue, ch)
+	p.mu.Unlock()
+
+	select {
+	case conn, ok := <-ch:
+		if !ok || conn == nil {
+			return nil, errors.New("connection pool is shutting down")
+		}
+		return conn, nil
+	case <-time.After(1 * time.Second):
+		// Timeout: remove from waitQueue
+		p.mu.Lock()
+		for i, waiter := range p.waitQueue {
+			if waiter == ch {
+				p.waitQueue = append(p.waitQueue[:i], p.waitQueue[i+1:]...)
+				break
+			}
+		}
+		p.mu.Unlock()
+		return nil, errors.New("connection pool exhausted (wait timeout)")
+	}
 }
 
 func (p *ConnectionPool) Release(conn *DbConn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if p.isShutdown {
+		conn.CheckedOutAt = time.Time{}
+		delete(p.activeConns, conn.ID)
+		return
+	}
+
+	// If there are waiters, hand over the connection immediately
+	for len(p.waitQueue) > 0 {
+		waiter := p.waitQueue[0]
+		p.waitQueue = p.waitQueue[1:]
+		
+		conn.CheckedOutAt = time.Now()
+		p.activeConns[conn.ID] = conn
+		select {
+		case waiter <- conn:
+			return
+		default:
+			// Waiter already timed out or gave up, try next waiter
+			conn.CheckedOutAt = time.Time{}
+		}
+	}
+
 	conn.CheckedOutAt = time.Time{}
 	delete(p.activeConns, conn.ID)
 	p.idleConns = append(p.idleConns, conn)
@@ -173,8 +222,8 @@ func (p *ConnectionPool) Release(conn *DbConn) {
 
 func (p *ConnectionPool) IncrementQueries() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.totalQueries++
+	p.mu.Unlock()
 }
 
 func (p *ConnectionPool) Stats() PoolStats {
@@ -197,6 +246,10 @@ func (p *ConnectionPool) Shutdown(ctx context.Context) error {
 	}
 	p.isShutdown = true
 	close(p.shutdownChan)
+	for _, waiter := range p.waitQueue {
+		close(waiter)
+	}
+	p.waitQueue = nil
 	p.mu.Unlock()
 
 	ticker := time.NewTicker(20 * time.Millisecond)

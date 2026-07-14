@@ -230,3 +230,100 @@ func TestPluggableQueryOptimizer(t *testing.T) {
 		t.Error("expected ClearCache to be called")
 	}
 }
+
+// rwSplitOptimizer routes SELECTs to the replica and all writes to primary.
+type rwSplitOptimizer struct{}
+
+func (o *rwSplitOptimizer) Route(srv *Server, query string, region string) (pool.Manager, string) {
+	q := query
+	if len(q) >= 6 && q[:6] == "SELECT" {
+		return srv.replicaPool, "replica"
+	}
+	return srv.primaryPool, "primary"
+}
+func (o *rwSplitOptimizer) GetCached(query string) ([]map[string]interface{}, bool) { return nil, false }
+func (o *rwSplitOptimizer) SetCached(query string, rows []map[string]interface{})   {}
+func (o *rwSplitOptimizer) ClearCache()                                              {}
+
+// TestReadWriteRoutingAccuracy verifies 100% routing correctness:
+// SELECT queries must go to replica, all other DML to primary.
+func TestReadWriteRoutingAccuracy(t *testing.T) {
+	ActiveQueryOptimizer = &rwSplitOptimizer{}
+	defer func() { ActiveQueryOptimizer = nil }()
+
+	primary := &mockPool{dialectVal: "postgres"}
+	replica := &mockPool{dialectVal: "postgres"}
+	srv := NewServer(primary, replica, nil)
+
+	readQueries := []string{
+		"SELECT id FROM users;",
+		"SELECT name FROM products WHERE active = true;",
+		"SELECT count(*) FROM orders;",
+	}
+	writeQueries := []string{
+		"INSERT INTO users (name) VALUES ('alice');",
+		"UPDATE users SET name = 'bob' WHERE id = 1;",
+		"DELETE FROM users WHERE id = 2;",
+	}
+
+	type result struct {
+		Status string `json:"status"`
+		Rows   []struct {
+			Pool string `json:"pool"`
+		} `json:"rows"`
+	}
+
+	wrongRoutes := 0
+
+	// Run 50 read queries — all must route to "replica"
+	for i := 0; i < 50; i++ {
+		q := readQueries[i%len(readQueries)]
+		body, _ := json.Marshal(QueryRequest{Query: q})
+		req := httptest.NewRequest("POST", "/api/db/query", bytes.NewReader(body))
+		rr := httptest.NewRecorder()
+		srv.HandleQuery(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Errorf("[read %d] unexpected status %d", i, rr.Code)
+			continue
+		}
+		var res result
+		if err := json.NewDecoder(rr.Body).Decode(&res); err != nil {
+			t.Errorf("[read %d] decode error: %v", i, err)
+			continue
+		}
+		if len(res.Rows) == 0 || res.Rows[0].Pool != "replica" {
+			wrongRoutes++
+			t.Errorf("[read %d] query %q routed to %q, want replica", i, q, res.Rows[0].Pool)
+		}
+	}
+
+	// Run 50 write queries — all must route to "primary"
+	for i := 0; i < 50; i++ {
+		q := writeQueries[i%len(writeQueries)]
+		body, _ := json.Marshal(QueryRequest{Query: q})
+		req := httptest.NewRequest("POST", "/api/db/query", bytes.NewReader(body))
+		rr := httptest.NewRecorder()
+		srv.HandleQuery(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Errorf("[write %d] unexpected status %d", i, rr.Code)
+			continue
+		}
+		var res result
+		if err := json.NewDecoder(rr.Body).Decode(&res); err != nil {
+			t.Errorf("[write %d] decode error: %v", i, err)
+			continue
+		}
+		if len(res.Rows) == 0 || res.Rows[0].Pool != "primary" {
+			wrongRoutes++
+			t.Errorf("[write %d] query %q routed to %q, want primary", i, q, res.Rows[0].Pool)
+		}
+	}
+
+	if wrongRoutes > 0 {
+		t.Errorf("routing accuracy: %d/%d queries misrouted", wrongRoutes, 100)
+	} else {
+		t.Logf("routing accuracy: 100%% (100/100 queries correctly routed)")
+	}
+}
